@@ -57,7 +57,7 @@ class Discovery {
         return;
       }
     }
-    final RawDatagramSocket sock = s!;
+    final RawDatagramSocket sock = s;
     sock.broadcastEnabled = true;
     final seen = <String>{};
     final sub = sock.listen((ev) {

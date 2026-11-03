@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import '../core/app_state.dart';
 import '../core/models.dart';
 import '../core/util.dart';
-import 'widgets.dart';
 
 class WifiPage extends StatefulWidget {
   const WifiPage({super.key});

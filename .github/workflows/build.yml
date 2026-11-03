@@ -51,7 +51,7 @@ jobs:
       - name: Build APK
         run: |
           echo "===== BUILD =====" >> ci.log
-          flutter build apk --release 2>&1 | tee -a ci.log
+          flutter build apk --release --target-platform android-arm64 --build-number=${{ github.run_number }} 2>&1 | tee -a ci.log
           cp build/app/outputs/flutter-apk/app-release.apk "WiFiHelp-${{ github.run_number }}.apk"
 
       - name: Publish release

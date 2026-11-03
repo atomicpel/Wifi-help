@@ -108,7 +108,7 @@ class _RunLogSheetState extends State<RunLogSheet> {
   @override
   void initState() {
     super.initState();
-    _start();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
   }
 
   Future<void> _start() async {
