@@ -1,12 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
-import '../core/models.dart';
 import '../core/native.dart';
 import '../core/walk.dart';
 import 'creds_dialog.dart';
 import 'device_page.dart';
-import 'widgets.dart';
 
 class WalkPage extends StatelessWidget {
   const WalkPage({super.key, this.onOpenMap});

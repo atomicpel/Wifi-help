@@ -71,7 +71,7 @@ class WalkController extends ChangeNotifier {
       }
       var guard = 0;
       while (current != null && guard++ < 16) {
-        final cur = current!;
+        final cur = current;
         if (!_visited.add(cur)) {
           _log('Пришёл по кругу на $cur — останавливаюсь.');
           break;
