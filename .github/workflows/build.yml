@@ -1,0 +1,78 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform files
+        run: |
+          flutter --version 2>&1 | tee ci.log
+          flutter create --platforms=android --org ru.atomicpel --project-name wifi_help . 2>&1 | tee -a ci.log
+          rm -rf test
+          python3 tool/patch_android.py 2>&1 | tee -a ci.log
+
+      - name: Pub get
+        run: flutter pub get 2>&1 | tee -a ci.log
+
+      - name: Analyze
+        continue-on-error: true
+        run: |
+          echo "===== ANALYZE =====" >> ci.log
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee -a ci.log
+
+      - name: Build APK
+        run: |
+          echo "===== BUILD =====" >> ci.log
+          flutter build apk --release 2>&1 | tee -a ci.log
+          cp build/app/outputs/flutter-apk/app-release.apk "WiFiHelp-${{ github.run_number }}.apk"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WiFi Помощник, сборка ${{ github.run_number }}
+          body: |
+            Автосборка из коммита ${{ github.sha }}.
+            Скачай APK ниже и установи на телефон.
+          files: WiFiHelp-${{ github.run_number }}.apk
+          make_latest: true
+
+      - name: Upload build log
+        if: always()
+        run: |
+          echo "STATUS=${{ job.status }} RUN=${{ github.run_number }} SHA=${{ github.sha }}" > status.txt
+          mkdir -p /tmp/logrepo && cd /tmp/logrepo
+          git init -q && git checkout -q -b ci-log
+          cp "$GITHUB_WORKSPACE/ci.log" . 2>/dev/null || echo "no log" > ci.log
+          cp "$GITHUB_WORKSPACE/status.txt" .
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com add .
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "log ${{ github.run_number }}"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" ci-log
