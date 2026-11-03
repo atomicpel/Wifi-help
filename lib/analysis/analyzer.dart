@@ -270,7 +270,7 @@ class Analyzer {
           final (d, r) = own24[i];
           final target = order[i % order.length];
           plan.add('${_name(d)}: ${r.channel ?? '?'}${r.autoChannel ? ' (авто)' : ''} → $target');
-          if (r.channel != target || r.autoChannel) {
+          if ((r.channel != target || r.autoChannel) && capsOf(d.effectiveVendor).channel) {
             fixes.add(FixAction(
               ip: d.ip,
               kind: FixKind.setChannel,
@@ -337,7 +337,7 @@ class Analyzer {
         for (var i = 0; i < own5.length; i++) {
           final (d, r) = own5[i];
           final target = pool[i % pool.length];
-          if (r.channel != target) {
+          if (r.channel != target && capsOf(d.effectiveVendor).channel) {
             fixes.add(FixAction(
               ip: d.ip,
               kind: FixKind.setChannel,

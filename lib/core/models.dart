@@ -27,8 +27,9 @@ enum Vendor {
   final int color;
   final bool routerVendor;
 
-  /// Есть ли драйвер автонастройки.
-  bool get supported => this == Vendor.keenetic || this == Vendor.mikrotik;
+  /// Есть ли драйвер (вход/опрос), пусть и с разными возможностями.
+  bool get supported =>
+      this == Vendor.keenetic || this == Vendor.mikrotik || this == Vendor.xiaomi || this == Vendor.tplink;
 
   int get defaultPort => this == Vendor.mikrotik ? 8728 : 80;
 

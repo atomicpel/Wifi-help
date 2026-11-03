@@ -6,6 +6,7 @@ import '../core/log.dart';
 import '../core/models.dart';
 import '../core/native.dart';
 import '../core/util.dart';
+import '../drivers/registry.dart';
 import 'creds_dialog.dart';
 import 'widgets.dart';
 
@@ -113,7 +114,7 @@ class _PasswordPageState extends State<PasswordPage> {
   @override
   Widget build(BuildContext context) {
     final routers = app.routers;
-    final ready = routers.where((d) => d.effectiveVendor.supported && app.vault.get(d.ip) != null).toList();
+    final ready = routers.where((d) => capsOf(d.effectiveVendor).password && app.vault.get(d.ip) != null).toList();
     final notReady = routers.where((d) => !ready.contains(d)).toList();
     if (!_init) {
       _sel.addAll(ready.map((d) => d.ip));
@@ -170,8 +171,8 @@ class _PasswordPageState extends State<PasswordPage> {
                 dense: true,
                 enabled: false,
                 title: Text('${d.ip}  ${d.title}'),
-                subtitle: Text(!d.effectiveVendor.supported
-                    ? '${d.effectiveVendor.label}: автонастройка пока не поддерживается'
+                subtitle: Text(!capsOf(d.effectiveVendor).password
+                    ? '${d.effectiveVendor.label}: смена пароля пока не настроена (меняй через веб-интерфейс)'
                     : 'нет сохранённого пароля'),
               ),
           ],
@@ -536,11 +537,14 @@ WiFi Помощник 0.1
 • MikroTik MNDP и UPnP/SSDP — модели и имена без пароля.
 • Опознание по веб-интерфейсу: Keenetic, MikroTik, TP-Link, Xiaomi, D-Link, Eltex, Huawei, ZTE, ASUS и др.
 • Карта: Интернет → шлюз → роутеры; с паролями связи строятся по реальным маршрутам.
+• Обход сети: от телефона вверх к интернету, роутер за роутером — на каждом спрашиваю пароль, читаю клиентов и куда он смотрит дальше, дохожу до самого дального и строю карту.
 
-Автонастройка (с бэкапом перед каждым изменением)
+Автонастройка (с бэкапом/снимком перед каждым изменением)
 • MikroTik (RouterOS API, порт 8728): опрос, бэкап, смена пароля, каналы и ширина Wi-Fi, выключение лишнего DHCP, автосогласование портов.
 • Keenetic (RCI): опрос, бэкап, смена пароля, каналы Wi-Fi, сохранение конфигурации.
-• TP-Link, Xiaomi и остальные: поиск, карта, эфир, встроенный веб-интерфейс. Драйверы добавляются по журналу «Разведки».
+• Xiaomi (MiWiFi/HyperOS): опрос, снимок настроек, каналы и ширина Wi-Fi. Пароль админа — через веб-интерфейс.
+• TP-Link: автоопределение прошивки (старые/Archer/Deco), вход где получается, подробный журнал для доводки под модель. Управление — через встроенный веб-интерфейс.
+• Остальные: поиск, карта, эфир, встроенный веб-интерфейс. Драйверы добавляются по журналу «Разведки».
 
 Проверки
 • Несколько DHCP-серверов в одной сети.

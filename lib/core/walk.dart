@@ -1,0 +1,209 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+
+import '../drivers/registry.dart';
+import 'app_state.dart';
+import 'ip.dart';
+import 'log.dart';
+import 'models.dart';
+import 'native.dart';
+
+enum HopStatus { pending, working, needPassword, needNextHop, unreachable, ok, skipped, edge, failed }
+
+class WalkHop {
+  WalkHop(this.ip);
+  final String ip;
+  Device? device;
+  HopStatus status = HopStatus.pending;
+  String? upstream;
+  String note = '';
+  int clients = 0;
+}
+
+/// Пошаговый обход сети от телефона вверх, к интернету. На каждом хопе:
+/// опознаём роутер, спрашиваем пароль (если нужно), заходим, читаем его
+/// WAN-шлюз (куда идти дальше) и клиентов. Доходим до роутера на краю
+/// интернета — это и есть «самый дальний». Потом карта строится сама.
+class WalkController extends ChangeNotifier {
+  final List<WalkHop> hops = [];
+  bool running = false;
+  bool finished = false;
+  String message = '';
+  WalkHop? waiting; // хоп, который ждёт действия пользователя
+  Completer<_Act>? _act;
+
+  final Set<String> _visited = {};
+
+  void _log(String s) {
+    message = s;
+    Log.i('walk', s);
+    notifyListeners();
+  }
+
+  Future<void> reset() async {
+    hops.clear();
+    _visited.clear();
+    running = false;
+    finished = false;
+    waiting = null;
+    message = '';
+    notifyListeners();
+  }
+
+  Future<void> start() async {
+    if (running) return;
+    await reset();
+    running = true;
+    notifyListeners();
+    try {
+      _log('Определяю шлюз телефона…');
+      final netMap = await Native.networkInfo();
+      final net = NetInfo.fromMap(netMap);
+      app.net = net;
+      var current = net.gateway;
+      if (current == null || Ip.parse(current) == null) {
+        _log('Не вижу шлюз — телефон не в локальной сети?');
+        finished = true;
+        running = false;
+        notifyListeners();
+        return;
+      }
+      var guard = 0;
+      while (current != null && guard++ < 16) {
+        final cur = current!;
+        if (!_visited.add(cur)) {
+          _log('Пришёл по кругу на $cur — останавливаюсь.');
+          break;
+        }
+        final next = await _handleHop(cur);
+        if (next == null) break;
+        current = next;
+      }
+      finished = true;
+      _log('Обход завершён: роутеров ${hops.where((h) => h.status == HopStatus.ok || h.status == HopStatus.edge).length}, '
+          'хопов ${hops.length}. Карта построена.');
+      await app.saveState();
+      app.analyzeLocal();
+    } catch (e, st) {
+      Log.e('walk', 'Обход упал', e, st);
+      _log('Ошибка обхода: $e');
+    } finally {
+      running = false;
+      waiting = null;
+      notifyListeners();
+    }
+  }
+
+  /// Возвращает IP следующего хопа вверх, либо null — закончить.
+  Future<String?> _handleHop(String ip) async {
+    final hop = WalkHop(ip);
+    hops.add(hop);
+    hop.status = HopStatus.working;
+    hop.device = app.ensureDevice(ip);
+    _log('Хоп ${hops.length}: $ip — опознаю…');
+    notifyListeners();
+
+    final d = hop.device!;
+    if (d.effectiveVendor == Vendor.unknown || d.ports.isEmpty) {
+      await app.probeDevice(d);
+    }
+    hop.note = d.effectiveVendor.label;
+
+    // недостижим?
+    if (d.ports.isEmpty && !d.icmp) {
+      hop.status = HopStatus.unreachable;
+      _log('$ip (${d.title}) не отвечает отсюда.');
+      final act = await _ask(hop, HopStatus.unreachable);
+      return act.nextHop;
+    }
+
+    final caps = capsOf(d.effectiveVendor);
+    if (!caps.query) {
+      hop.status = HopStatus.needNextHop;
+      hop.note = '${d.effectiveVendor.label}: вход по API пока не настроен';
+      _log('$ip — ${d.effectiveVendor.label}: не могу зайти по API. Открой веб-интерфейс и подскажи следующий роутер.');
+      final act = await _ask(hop, HopStatus.needNextHop);
+      return act.nextHop;
+    }
+
+    if (app.vault.get(ip) == null) {
+      hop.status = HopStatus.needPassword;
+      _log('$ip (${d.effectiveVendor.label}) — нужен логин и пароль.');
+      final act = await _ask(hop, HopStatus.needPassword);
+      if (act.skip) {
+        hop.status = HopStatus.skipped;
+        return act.nextHop;
+      }
+      if (app.vault.get(ip) == null) {
+        hop.status = HopStatus.skipped;
+        return act.nextHop;
+      }
+    }
+
+    hop.status = HopStatus.working;
+    _log('$ip — захожу и читаю…');
+    notifyListeners();
+    final err = await app.queryRouter(d);
+    if (err != null) {
+      hop.status = HopStatus.failed;
+      hop.note = err;
+      _log('$ip — не удалось: $err');
+      final act = await _ask(hop, HopStatus.needNextHop);
+      return act.nextHop;
+    }
+
+    final info = d.info!;
+    hop.clients = info.arp.length;
+    hop.upstream = info.gateway;
+    _log('$ip (${d.title}) — ок. Клиентов: ${hop.clients}. Вверх ведёт: ${info.gateway ?? 'нет (край сети)'}');
+
+    final up = info.gateway;
+    final upInt = Ip.parse(up ?? '');
+    if (up == null || upInt == null) {
+      hop.status = HopStatus.edge;
+      hop.note = 'нет шлюза вверх';
+      return null;
+    }
+    if (!Ip.isPrivate(upInt)) {
+      hop.status = HopStatus.edge;
+      hop.note = 'дальше интернет ($up)';
+      _log('$ip — это самый дальний роутер: за ним уже интернет ($up).');
+      return null;
+    }
+    if (_visited.contains(up)) {
+      hop.status = HopStatus.ok;
+      return null;
+    }
+    hop.status = HopStatus.ok;
+    return up;
+  }
+
+  Future<_Act> _ask(WalkHop hop, HopStatus kind) async {
+    waiting = hop;
+    hop.status = kind;
+    notifyListeners();
+    _act = Completer<_Act>();
+    final a = await _act!.future;
+    waiting = null;
+    notifyListeners();
+    return a;
+  }
+
+  // --- вызовы из интерфейса
+  void resumeAfterPassword() => _act?.complete(const _Act());
+
+  void provideNextHop(String? ip) => _act?.complete(_Act(nextHop: ip));
+
+  void skipAndContinue(String? nextHop) => _act?.complete(_Act(skip: true, nextHop: nextHop));
+
+  void finishNow() => _act?.complete(const _Act());
+}
+
+class _Act {
+  const _Act({this.nextHop, this.skip = false});
+  final String? nextHop;
+  final bool skip;
+}
+
+final WalkController walk = WalkController();

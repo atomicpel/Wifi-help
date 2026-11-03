@@ -5,6 +5,7 @@ import '../core/ip.dart';
 import '../core/models.dart';
 import '../core/util.dart';
 import 'device_page.dart';
+import 'walk_page.dart';
 import 'widgets.dart';
 
 enum TKind { internet, device, group }
@@ -221,6 +222,12 @@ class _MapPageState extends State<MapPage> {
             title: const Text('Карта сети'),
             actions: [
               IconButton(
+                tooltip: 'Обход сети от интернета',
+                icon: const Icon(Icons.alt_route),
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+                    builder: (_) => WalkPage(onOpenMap: () => Navigator.of(context).pop()))),
+              ),
+              IconButton(
                 tooltip: _showAll ? 'Только роутеры' : 'Показать все устройства',
                 icon: Icon(_showAll ? Icons.devices_other : Icons.router),
                 onPressed: () => setState(() => _showAll = !_showAll),
@@ -287,6 +294,13 @@ class _MapPageState extends State<MapPage> {
               'ping по 65 тыс. адресов, проверка портов, MikroTik MNDP и UPnP. '
               'Обычно 15–40 секунд.',
               textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(
+                  builder: (_) => WalkPage(onOpenMap: () => Navigator.of(context).pop()))),
+              icon: const Icon(Icons.alt_route),
+              label: const Text('Или пройти сеть по цепочке роутеров'),
             ),
             if (app.scanNotes.isNotEmpty) ...[
               const SizedBox(height: 12),

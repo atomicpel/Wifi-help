@@ -482,6 +482,25 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Device ensureDevice(String ip) {
+    final d = devices.putIfAbsent(ip, () => Device(ip));
+    return d;
+  }
+
+  /// Быстрое опознание одного адреса (для пошагового обхода сети).
+  Future<void> probeDevice(Device d) async {
+    final t = settings.tcpTimeoutMs + 300;
+    await runPool<int>(const [80, 443, 8080, 8443, 8291, 8728, 22], 7, (p) async {
+      final r = await tcpProbe(d.ip, p, Duration(milliseconds: t));
+      if (r == ProbeResult.open) d.ports.add(p);
+    });
+    if (d.ports.contains(80) || d.ports.contains(443) || d.ports.contains(8080) || d.ports.contains(8443)) {
+      await Fingerprint.identify(d);
+    }
+    Fingerprint.byPorts(d);
+    notifyListeners();
+  }
+
   // ---------------------------------------------------------- misc
   Future<String> survey(Device d) async {
     try {
