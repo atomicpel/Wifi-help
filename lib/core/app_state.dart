@@ -65,6 +65,7 @@ class AppState extends ChangeNotifier {
     try {
       dir = await Native.filesDir();
       await Log.init(dir);
+      vault.vendorOf = (ip) => devices[ip]?.effectiveVendor.name;
       try {
         phone = await Native.deviceInfo();
       } catch (_) {}
@@ -170,6 +171,7 @@ class AppState extends ChangeNotifier {
 
   // -------------------------------------------------------------- query
   Future<String?> queryRouter(Device d) async {
+    if (d.aliasOf != null) return '${d.ip} — второй адрес роутера ${d.aliasOf}, опрашиваю его по основному адресу';
     final cred = vault.get(d.ip);
     if (cred == null) return 'Нет логина/пароля';
     final drv = driverFor(d, cred);
@@ -235,6 +237,14 @@ class AppState extends ChangeNotifier {
 
   /// ARP-таблицы роутеров показывают устройства и в других подсетях.
   void _learnFromRouter(Device r, RouterInfo info) {
+    // другие адреса этого же роутера (WAN, второй LAN) — склеиваем с ним
+    for (final a in info.addrs) {
+      final other = devices[a.ip];
+      if (other != null && other.ip != r.ip && other.aliasOf != r.ip) {
+        other.aliasOf = r.ip;
+        Log.i('query', '${a.ip} — это ${a.iface}-адрес роутера ${r.ip} (${r.title}), склеиваю');
+      }
+    }
     var added = 0;
     for (final e in info.arp) {
       final ipInt = Ip.parse(e.ip);
@@ -259,7 +269,9 @@ class AppState extends ChangeNotifier {
     _status('Опрашиваю роутеры…');
     await rebindNetwork();
     try {
-      final targets = devices.values.where((d) => vault.get(d.ip) != null && d.effectiveVendor.supported).toList();
+      final targets = devices.values
+          .where((d) => d.aliasOf == null && vault.get(d.ip) != null && d.effectiveVendor.supported)
+          .toList();
       var n = 0;
       var errs = 0;
       await runPool<Device>(targets, 4, (d) async {
@@ -505,7 +517,7 @@ class AppState extends ChangeNotifier {
           final name = await _saveBackup(d, await drv.backup());
           out('  бэкап сохранён: $name');
           await drv.changePassword(newPassword);
-          await vault.set(ip, Credential(login: cred.login, password: newPassword, port: cred.port));
+          await vault.set(ip, cred.copyWith(password: newPassword));
           out('  ✔ пароль изменён, вход с новым паролем проверен');
           ok++;
         } catch (e, st) {

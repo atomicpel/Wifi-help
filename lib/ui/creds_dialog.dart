@@ -85,7 +85,9 @@ class _CredsDialogState extends State<_CredsDialog> {
       return;
     }
     for (final d in widget.targets) {
-      await app.vault.set(d.ip, _cred);
+      final c = _cred;
+      await app.vault.set(d.ip,
+          Credential(login: c.login, password: c.password, port: c.port, vendor: d.effectiveVendor.name));
     }
     app.analyzeLocal();
     if (mounted) Navigator.pop(context, true);

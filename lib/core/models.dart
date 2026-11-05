@@ -273,6 +273,10 @@ class Device {
   bool upnpGateway = false;
   bool routerHint = false;
   bool offline = false;
+
+  /// Если это второй адрес уже известного роутера (например, его WAN) —
+  /// IP основного. Такие адреса не опрашиваются и не рисуются отдельно.
+  String? aliasOf;
   final Set<String> sources = {};
   RouterInfo? info;
   String? lastError;
@@ -286,6 +290,7 @@ class Device {
       (ports.contains(554) && !effectiveVendor.routerVendor && !isGateway);
 
   bool get isRouter =>
+      aliasOf == null &&
       !isCamera &&
       (isGateway ||
           upnpGateway ||
@@ -312,10 +317,16 @@ class Device {
   /// Сохраняет то, что не даёт новый скан: ручной выбор производителя,
   /// данные с роутера, MAC и имена.
   void keepFrom(Device o) {
+    // На этом IP теперь другое устройство (другая сеть) — старые данные не берём.
+    final ov = o.effectiveVendor;
+    if (vendor != Vendor.unknown && ov != Vendor.unknown && vendor != ov && o.vendorOverride == null) {
+      return;
+    }
     vendorOverride ??= o.vendorOverride;
     info ??= o.info;
     infoAt ??= o.infoAt;
     lastError ??= o.lastError;
+    aliasOf ??= o.aliasOf;
     mac ??= o.mac;
     identity ??= o.identity;
     model ??= o.model;
@@ -340,6 +351,7 @@ class Device {
         'upnpGateway': upnpGateway,
         'routerHint': routerHint,
         'offline': offline,
+        'aliasOf': aliasOf,
         'sources': sources.toList(),
         'info': info?.toJson(),
         'lastError': lastError,
@@ -368,6 +380,7 @@ class Device {
     d.upnpGateway = j['upnpGateway'] == true;
     d.routerHint = j['routerHint'] == true;
     d.offline = j['offline'] == true;
+    d.aliasOf = asStr(j['aliasOf']);
     for (final s in (j['sources'] as List? ?? [])) {
       d.sources.add('$s');
     }
@@ -380,14 +393,21 @@ class Device {
 }
 
 class Credential {
-  Credential({required this.login, required this.password, this.port});
+  Credential({required this.login, required this.password, this.port, this.vendor});
   final String login;
   final String password;
   final int? port;
 
-  Map<String, dynamic> toJson() => {'login': login, 'password': password, 'port': port};
-  factory Credential.fromJson(Map<String, dynamic> j) =>
-      Credential(login: '${j['login']}', password: '${j['password']}', port: asInt(j['port']));
+  /// Для какого производителя сохранён пароль: если на этом адресе теперь
+  /// другой роутер (другая сеть), пароль не подставляется.
+  final String? vendor;
+
+  Credential copyWith({String? password}) =>
+      Credential(login: login, password: password ?? this.password, port: port, vendor: vendor);
+
+  Map<String, dynamic> toJson() => {'login': login, 'password': password, 'port': port, 'vendor': vendor};
+  factory Credential.fromJson(Map<String, dynamic> j) => Credential(
+      login: '${j['login']}', password: '${j['password']}', port: asInt(j['port']), vendor: asStr(j['vendor']));
 }
 
 class NetInfo {

@@ -14,7 +14,19 @@ class Vault {
 
   Map<String, Credential> get all => Map.unmodifiable(_byIp);
 
-  Credential? get(String ip) => _byIp[ip];
+  /// Подсказка: какой производитель сейчас на этом адресе (ставит AppState).
+  String? Function(String ip)? vendorOf;
+
+  Credential? get(String ip) {
+    final c = _byIp[ip];
+    if (c == null || c.vendor == null || vendorOf == null) return c;
+    final now = vendorOf!(ip);
+    if (now == null || now == 'unknown' || now == c.vendor) return c;
+    return null; // пароль от другого роутера, который раньше был на этом IP
+  }
+
+  /// Сохранён ли пароль хоть какой-то (даже от другого роутера).
+  Credential? raw(String ip) => _byIp[ip];
 
   Future<void> load(String dir) async {
     _path = '$dir/vault.bin';

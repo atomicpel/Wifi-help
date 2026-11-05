@@ -12,10 +12,11 @@ import 'driver.dart';
 import 'tplink_crypto.dart';
 
 class _Resp {
-  _Resp(this.status, this.body, this.location);
+  _Resp(this.status, this.body, this.location, [this.auth]);
   final int status;
   final String body;
   final String? location;
+  final String? auth; // WWW-Authenticate
 }
 
 /// TP-Link. Схема определяется сама:
@@ -49,6 +50,28 @@ class TplinkDriver extends RouterDriver {
   String _token = '';
   // cgi (0.9.1)
   String _cgiToken = '';
+  bool _cgiRsa = false;
+  // basic (старые WR940N/WR740N с HTTP Basic)
+  String _httpBasic = '';
+
+  // TP-Link-роутеры пускают одного администратора: сессии ко всем TP-Link
+  // идут строго по очереди (в т.ч. к одному роутеру по двум его адресам).
+  static Future<void> _tail = Future<void>.value();
+  Completer<void>? _held;
+
+  Future<void> _acquire() async {
+    final prev = _tail;
+    final c = Completer<void>();
+    _tail = c.future;
+    _held = c;
+    await prev.timeout(const Duration(seconds: 90), onTimeout: () {});
+  }
+
+  void _release() {
+    final h = _held;
+    _held = null;
+    if (h != null && !h.isCompleted) h.complete();
+  }
   // gdpr
   String _nn = '';
   String _ee = '';
@@ -70,6 +93,7 @@ class TplinkDriver extends RouterDriver {
     if (_cookies.isNotEmpty) {
       req.headers.set(HttpHeaders.cookieHeader, _cookies.entries.map((e) => '${e.key}=${e.value}').join('; '));
     }
+    if (_httpBasic.isNotEmpty) req.headers.set(HttpHeaders.authorizationHeader, _httpBasic);
     headers?.forEach(req.headers.set);
     if (body != null) {
       final b = utf8.encode(body);
@@ -85,11 +109,12 @@ class TplinkDriver extends RouterDriver {
     }
     final text = await resp.transform(const Utf8Decoder(allowMalformed: true)).join().timeout(const Duration(seconds: 20));
     final loc = resp.headers.value(HttpHeaders.locationHeader);
+    final wwwAuth = resp.headers.value(HttpHeaders.wwwAuthenticateHeader);
     if (log) {
       Log.d(_tag, '$method ${Uri.parse(url).path}${Uri.parse(url).query.isNotEmpty ? '?…' : ''} → ${resp.statusCode}, '
           '${text.length} б, ${sw.elapsedMilliseconds} мс${loc != null ? ' → $loc' : ''}');
     }
-    return _Resp(resp.statusCode, text, loc);
+    return _Resp(resp.statusCode, text, loc, wwwAuth);
   }
 
   Future<bool> _portOpen(int port) async {
@@ -108,32 +133,43 @@ class TplinkDriver extends RouterDriver {
     _base = https ? 'https://$host' : 'http://$host';
     final home = await _req('GET', '$_base/', headers: {'Accept': 'text/html,*/*', 'Referer': '$_base/'});
     final low = home.body.toLowerCase();
-    if (low.contains('deco')) {
+    final flat = home.body.replaceAll(RegExp(r'\s+'), ' ');
+    Log.d(_tag, 'главная: HTTP ${home.status}, ${home.body.length} б, auth=${home.auth ?? '-'}, '
+        'начало: ${flat.length > 200 ? flat.substring(0, 200) : flat}');
+    if (home.status == 401 && (home.auth ?? '').toLowerCase().contains('basic')) {
+      _scheme = 'basic';
+    } else if (low.contains('deco')) {
       _scheme = 'deco';
-    } else if (low.contains('encrypt.js') || low.contains('tpencrypt') || low.contains('cgi_gdpr') || low.contains('oid_str.js') && low.contains('pc-login')) {
-      final p = await _req('POST', '$_base/cgi/getParm', headers: {'Referer': '$_base/', 'Accept': '*/*'});
-      final nn = RegExp(r'var nn="([0-9a-fA-F]+)"').firstMatch(p.body)?.group(1);
-      final ee = RegExp(r'var ee="([0-9a-fA-F]+)"').firstMatch(p.body)?.group(1);
-      final seq = RegExp(r'var seq="(\d+)"').firstMatch(p.body)?.group(1);
-      if (nn != null && ee != null && seq != null) {
-        _scheme = 'gdpr';
-        _nn = nn;
-        _ee = ee;
-        _seq = int.parse(seq);
-        // какой RSA: смотрим, как веб-страница вызывает $.rsa.encrypt(..., flag)
-        _rawRsa = await _detectRawRsa(home.body);
-      } else if (low.contains('luci') || low.contains('stok')) {
-        _scheme = 'luci';
-      } else {
-        _scheme = 'modern-unknown';
-      }
     } else if (low.contains('userrpm') || low.contains('loginrpm')) {
       _scheme = 'legacy';
     } else {
-      // 0.9.1-прошивки (TL-WR840N v4/v5, TL-WR845N v4…): cookie + TokenID + /cgi?
-      _scheme = 'cgi';
+      var p = await _req('POST', '$_base/cgi/getParm', headers: {'Referer': '$_base/', 'Accept': '*/*'});
+      if (!p.body.contains('nn')) p = await _req('GET', '$_base/cgi/getParm', headers: {'Referer': '$_base/'});
+      final pf = p.body.replaceAll(RegExp(r'\s+'), ' ');
+      Log.d(_tag, 'getParm: ${pf.length > 300 ? pf.substring(0, 300) : pf}');
+      final nn = RegExp(r'''nn\s*=\s*["']([0-9a-fA-F]+)["']''').firstMatch(p.body)?.group(1);
+      final ee = RegExp(r'''ee\s*=\s*["']([0-9a-fA-F]+)["']''').firstMatch(p.body)?.group(1);
+      final seq = RegExp(r'''seq\s*=\s*["']?(\d+)''').firstMatch(p.body)?.group(1);
+      if (nn != null && ee != null) {
+        _nn = nn;
+        _ee = ee;
+      }
+      if (nn != null && ee != null && seq != null) {
+        _scheme = 'gdpr';
+        _seq = int.parse(seq);
+        _rawRsa = await _detectRawRsa(home.body);
+      } else if (nn != null && ee != null) {
+        _scheme = 'cgi';
+        _cgiRsa = true; // вариант MR200: RSA-вход через /cgi/login
+      } else if (low.contains('/cgi-bin/luci') || low.contains(';stok=')) {
+        _scheme = 'luci';
+      } else {
+        _scheme = 'cgi'; // 0.9.1: cookie Basic + /cgi?
+      }
     }
-    Log.i(_tag, 'Схема входа: «$_scheme»${_scheme == 'gdpr' ? ' (RSA ${_rawRsa ? 'без паддинга' : 'PKCS#1'}, ключ ${_nn.length * 4} бит)' : ''}');
+    Log.i(_tag, 'Схема входа: «$_scheme»'
+        '${_scheme == 'gdpr' ? ' (RSA ${_rawRsa ? 'без паддинга' : 'PKCS#1'}, ключ ${_nn.length * 4} бит)' : ''}'
+        '${_scheme == 'cgi' ? (_cgiRsa ? ' (RSA-вход /cgi/login)' : ' (cookie Basic)') : ''}');
   }
 
   Future<bool> _detectRawRsa(String homeBody) async {
@@ -156,8 +192,11 @@ class TplinkDriver extends RouterDriver {
   // --------------------------------------------------------------- login
   @override
   Future<void> login() async {
+    if (_held == null) await _acquire();
     await _detect();
     switch (_scheme) {
+      case 'basic':
+        await _basicLogin();
       case 'cgi':
         await _cgiLogin();
       case 'legacy':
@@ -175,70 +214,71 @@ class TplinkDriver extends RouterDriver {
     _loggedIn = true;
   }
 
-  // ---- cgi (0.9.1: TL-WR840N v4, TL-WR845N v4 и т.п.)
-  Future<bool> _cgiTokenFromHome() async {
-    final r = await _req('GET', '$_base/', headers: {'Referer': '$_base/', 'Accept': 'text/html,*/*'});
-    final t = RegExp(r'var\s+token\s*=\s*"([^"]+)"').firstMatch(r.body)?.group(1);
-    if (t != null && t.isNotEmpty) {
-      _cgiToken = t;
-      return true;
+  // ---- cgi (0.9.1: TL-WR840N v4, TL-WR845N v4, MR200-подобные)
+  /// После шага входа: забираем TokenID (если прошивка его выдаёт) и
+  /// проверяем, что роутер реально отдаёт данные.
+  Future<bool> _cgiCheck(String how) async {
+    final home = await _req('GET', '$_base/', headers: {'Referer': '$_base/', 'Accept': 'text/html,*/*'});
+    _cgiToken = RegExp(r'''var\s+token\s*=\s*["']([^"']+)["']''').firstMatch(home.body)?.group(1) ?? '';
+    final flat = home.body.replaceAll(RegExp(r'\s+'), ' ');
+    Log.d(_tag, '[$how] главная после входа: ${home.body.length} б, TokenID ${_cgiToken.isEmpty ? 'нет' : 'есть'}; '
+        '${flat.length > 160 ? flat.substring(0, 160) : flat}');
+    try {
+      final r = await _act([(1, 'IGD_DEV_INFO', '0,0,0,0,0,0', ['modelName', 'softwareVersion'])]);
+      final ok = r['0']?.firstOrNull?.isNotEmpty ?? false;
+      if (ok) Log.i(_tag, 'Вход ($how) выполнен: ${r['0']!.first}');
+      return ok;
+    } catch (e) {
+      Log.d(_tag, '[$how] данные не отдаёт: $e');
+      return false;
     }
-    final low = r.body.toLowerCase();
-    if (low.contains('only one') || low.contains('одно подключ')) _busy = true;
-    return false;
   }
 
-  bool _busy = false;
+  Future<bool> _cgiTryCookie(String value, String how) async {
+    _cookies
+      ..clear()
+      ..['Authorization'] = value;
+    return _cgiCheck(how);
+  }
+
+  Future<bool> _cgiTryRsa() async {
+    if (_nn.isEmpty) return false;
+    _cookies.clear();
+    final u = TplinkCrypto.rsaPkcs1(cred.login, _nn, _ee);
+    final pw = TplinkCrypto.rsaPkcs1(base64.encode(utf8.encode(cred.password)), _nn, _ee);
+    final r = await _req('POST', '$_base/cgi/login?UserName=$u&Passwd=$pw&Action=1&LoginStatus=0',
+        headers: {'Referer': '$_base/'});
+    Log.d(_tag, 'RSA /cgi/login → ${r.status}: ${r.body.length > 200 ? r.body.substring(0, 200) : r.body}');
+    return _cgiCheck('RSA /cgi/login');
+  }
 
   Future<void> _cgiLogin() async {
-    _busy = false;
-    final b64plain = base64.encode(utf8.encode('${cred.login}:${cred.password}'));
-    final md5hex = md5.convert(utf8.encode(cred.password)).toString();
-    final b64md5 = base64.encode(utf8.encode('${cred.login}:$md5hex'));
-    final variants = <(String, String)>[
-      ('Basic $b64plain', 'cookie base64(логин:пароль)'),
-      ('Basic $b64md5', 'cookie base64(логин:md5)'),
+    final plain = 'Basic ${base64.encode(utf8.encode('${cred.login}:${cred.password}'))}';
+    final attempts = <Future<bool> Function()>[
+      if (_cgiRsa) _cgiTryRsa,
+      () => _cgiTryCookie(plain, 'cookie Basic'),
+      if (!_cgiRsa && _nn.isNotEmpty) _cgiTryRsa,
     ];
-    for (final v in variants) {
-      _cookies
-        ..clear()
-        ..['Authorization'] = v.$1;
-      if (await _cgiTokenFromHome()) {
-        Log.i(_tag, 'Вход (${v.$2}) выполнен, TokenID получен');
-        return;
-      }
-      if (_busy) break;
-    }
-    // вариант MR200: RSA-вход через /cgi/login
-    if (!_busy) {
-      _cookies.clear();
-      final p = await _req('GET', '$_base/cgi/getParm', headers: {'Referer': '$_base/'});
-      final nn = RegExp(r'var nn="([0-9a-fA-F]+)"').firstMatch(p.body)?.group(1);
-      final ee = RegExp(r'var ee="([0-9a-fA-F]+)"').firstMatch(p.body)?.group(1);
-      if (nn != null && ee != null) {
-        final u = TplinkCrypto.rsaPkcs1(cred.login, nn, ee);
-        final pw = TplinkCrypto.rsaPkcs1(base64.encode(utf8.encode(cred.password)), nn, ee);
-        await _req('POST', '$_base/cgi/login?UserName=$u&Passwd=$pw&Action=1&LoginStatus=0', headers: {'Referer': '$_base/'});
-        if (await _cgiTokenFromHome()) {
-          Log.i(_tag, 'Вход (RSA /cgi/login) выполнен, TokenID получен');
-          return;
-        }
-      }
-    }
-    // последняя попытка — старая схема userRpm
-    if (!_busy) {
-      try {
-        await _legacyLogin();
-        _scheme = 'legacy';
-        return;
-      } catch (_) {}
+    for (final a in attempts) {
+      if (await a()) return;
     }
     await _dumpLoginJs();
-    throw DriverException(_busy
-        ? 'TP-Link: к роутеру уже подключён другой администратор (браузер или «Веб-интерфейс» в программе). '
-            'Закрой его и подожди ~5 минут — роутер пускает только одного.'
-        : 'TP-Link: ни один вариант входа не подошёл. Проверь пароль; если верный — пришли «Отчёт», '
-            'я записал в журнал код входа этой прошивки.');
+    throw DriverException('TP-Link: вход не прошёл. Проверь логин и пароль (как в браузере). '
+        'Если пароль точно верный — закрой веб-интерфейс этого роутера (он пускает одного администратора), '
+        'подожди пару минут и повтори; если снова нет — пришли «Отчёт».');
+  }
+
+  // ---- basic (старые WR940N/WR740N: настоящая HTTP Basic-авторизация)
+  Future<void> _basicLogin() async {
+    _httpBasic = 'Basic ${base64.encode(utf8.encode('${cred.login}:${cred.password}'))}';
+    _token = '';
+    final r = await _req('GET', '$_base/userRpm/StatusRpm.htm', headers: {'Referer': '$_base/userRpm/MenuRpm.htm'});
+    if (r.status == 401) {
+      _httpBasic = '';
+      throw DriverException('TP-Link: неверный логин или пароль (роутер ответил 401).');
+    }
+    if (r.status != 200) throw DriverException('TP-Link: страница состояния → HTTP ${r.status}');
+    Log.i(_tag, 'Вход (HTTP Basic) выполнен');
   }
 
   /// Пишет в журнал фрагменты lib.js/login-скриптов, отвечающие за вход.
@@ -280,7 +320,8 @@ class TplinkDriver extends RouterDriver {
   // ---- legacy (TL-WR8xx)
   String _escape(String s) => s.replaceAll('%', '%25').replaceAll(' ', '%20').replaceAll('=', '%3D').replaceAll('+', '%2B');
 
-  String get _legacyReferer => '$_base/$_token/userRpm/MenuRpm.htm';
+  String get _tp => _token.isEmpty ? '' : '/$_token';
+  String get _legacyReferer => '$_base$_tp/userRpm/MenuRpm.htm';
 
   bool _isReauth(String doc) {
     final m = RegExp(r'<script[^>]*>([\s\S]*?)</script>', caseSensitive: false).firstMatch(doc);
@@ -323,7 +364,7 @@ class TplinkDriver extends RouterDriver {
   }
 
   Future<String> _legacyPage(String name) async {
-    final r = await _req('GET', '$_base/$_token/userRpm/$name.htm', headers: {'Referer': _legacyReferer});
+    final r = await _req('GET', '$_base$_tp/userRpm/$name.htm', headers: {'Referer': _legacyReferer});
     if (r.status != 200 || _isReauth(r.body)) throw DriverException('TP-Link: страница $name недоступна (${r.status})');
     return r.body;
   }
@@ -444,7 +485,7 @@ class TplinkDriver extends RouterDriver {
   Future<void> _legacyLogout() async {
     if (_token.isEmpty) return;
     try {
-      await _req('GET', '$_base/$_token/userRpm/LogoutRpm.htm', headers: {'Referer': _legacyReferer});
+      await _req('GET', '$_base$_tp/userRpm/LogoutRpm.htm', headers: {'Referer': _legacyReferer});
       Log.d(_tag, 'Выход выполнен');
     } catch (_) {}
   }
@@ -502,6 +543,9 @@ class TplinkDriver extends RouterDriver {
       final r = await _req('POST', '$_base/cgi?$types', body: sb.toString(),
           headers: {'Referer': '$_base/', 'TokenID': _cgiToken, 'Accept': '*/*'});
       if (r.status != 200) throw DriverException('TP-Link: запрос данных → HTTP ${r.status}');
+      final err = RegExp(r'\[error\](\d+)').firstMatch(r.body)?.group(1);
+      if (err != null && err != '0') throw DriverException('TP-Link: роутер вернул ошибку $err');
+      if (err == null) throw DriverException('TP-Link: непонятный ответ (${r.body.length} б)');
       return _parseActs(r.body);
     }
     final data = '$types\r\n$sb';
@@ -663,6 +707,7 @@ class TplinkDriver extends RouterDriver {
       if (_scheme == 'gdpr' || _scheme == 'cgi') await _gdprLogout();
     }
     _loggedIn = false;
+    _release();
     _client.close(force: true);
   }
 
