@@ -46,7 +46,7 @@ class WalkPage extends StatelessWidget {
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                     const SizedBox(height: 12),
-                    if (!walk.running)
+                    if (!walk.running && !walk.pickStart)
                       FilledButton.icon(
                         onPressed: walk.start,
                         icon: const Icon(Icons.alt_route),
@@ -73,6 +73,7 @@ class WalkPage extends StatelessWidget {
               Expanded(
                 child: ListView(
                   children: [
+                    if (walk.pickStart) _startPicker(context),
                     for (var i = 0; i < walk.hops.length; i++) _hopTile(context, i, walk.hops[i]),
                     if (walk.waiting != null) _prompt(context, walk.waiting!),
                     if (walk.finished && !walk.running) ...[
@@ -92,6 +93,35 @@ class WalkPage extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+
+  Widget _startPicker(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.all(12),
+      color: Theme.of(context).colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('С какого роутера начать?', style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 4),
+            const Text('Телефон подключён по VPN-туннелю, поэтому обычного шлюза нет. '
+                'Выбери любой роутер из сети — я пойду от него вверх к интернету.'),
+            const SizedBox(height: 8),
+            for (final d in walk.startCandidates)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.router),
+                title: Text('${d.ip}  ${d.title}'),
+                subtitle: Text('${d.effectiveVendor.label}'
+                    '${app.vault.get(d.ip) != null ? ' · пароль есть' : ''}'),
+                onTap: () => walk.startFrom(d.ip),
+              ),
+          ],
+        ),
+      ),
     );
   }
 

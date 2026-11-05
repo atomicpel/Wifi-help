@@ -21,16 +21,21 @@ class WalkHop {
   int clients = 0;
 }
 
-/// Пошаговый обход сети от телефона вверх, к интернету. На каждом хопе:
-/// опознаём роутер, спрашиваем пароль (если нужно), заходим, читаем его
-/// WAN-шлюз (куда идти дальше) и клиентов. Доходим до роутера на краю
-/// интернета — это и есть «самый дальний». Потом карта строится сама.
+/// Пошаговый обход сети к интернету. На каждом хопе: опознаём роутер,
+/// спрашиваем пароль (если нужно), заходим, читаем WAN-шлюз (куда идти
+/// дальше) и клиентов. Доходим до роутера на краю интернета — это и есть
+/// «самый дальний». Потом карта строится сама.
+///
+/// Если телефон подключён без обычного шлюза (VPN-туннель, как tun1 у
+/// Павла), с чего начать — спрашиваем: показываем список роутеров из скана.
 class WalkController extends ChangeNotifier {
   final List<WalkHop> hops = [];
   bool running = false;
   bool finished = false;
+  bool pickStart = false;
+  List<Device> startCandidates = [];
   String message = '';
-  WalkHop? waiting; // хоп, который ждёт действия пользователя
+  WalkHop? waiting;
   Completer<_Act>? _act;
 
   final Set<String> _visited = {};
@@ -46,6 +51,8 @@ class WalkController extends ChangeNotifier {
     _visited.clear();
     running = false;
     finished = false;
+    pickStart = false;
+    startCandidates = [];
     waiting = null;
     message = '';
     notifyListeners();
@@ -57,20 +64,49 @@ class WalkController extends ChangeNotifier {
     running = true;
     notifyListeners();
     try {
-      _log('Определяю шлюз телефона…');
+      _log('Определяю, с какого роутера начать…');
       final netMap = await Native.networkInfo();
-      final net = NetInfo.fromMap(netMap);
-      app.net = net;
-      var current = net.gateway;
-      if (current == null || Ip.parse(current) == null) {
-        _log('Не вижу шлюз — телефон не в локальной сети?');
+      app.net = NetInfo.fromMap(netMap);
+      final gw = app.net?.gateway;
+      if (gw != null && Ip.parse(gw) != null) {
+        await _climb(gw);
+        return;
+      }
+      // нет обычного шлюза (VPN/туннель) — просим выбрать старт
+      startCandidates = app.routers;
+      if (startCandidates.isEmpty) {
+        _log('Не из чего начать: сначала просканируй сеть на вкладке «Карта».');
         finished = true;
         running = false;
         notifyListeners();
         return;
       }
+      pickStart = true;
+      running = false;
+      _log('Телефон подключён без обычного шлюза (похоже, VPN-туннель). '
+          'Выбери роутер, с которого начать обход — обычно ближний к тебе или самый дальний.');
+      notifyListeners();
+    } catch (e, st) {
+      Log.e('walk', 'Старт обхода упал', e, st);
+      _log('Ошибка: $e');
+      running = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> startFrom(String ip) async {
+    if (running) return;
+    pickStart = false;
+    running = true;
+    notifyListeners();
+    await _climb(ip);
+  }
+
+  Future<void> _climb(String first) async {
+    try {
+      var current = first;
       var guard = 0;
-      while (current != null && guard++ < 16) {
+      while (guard++ < 16) {
         final cur = current;
         if (!_visited.add(cur)) {
           _log('Пришёл по кругу на $cur — останавливаюсь.');
@@ -81,8 +117,8 @@ class WalkController extends ChangeNotifier {
         current = next;
       }
       finished = true;
-      _log('Обход завершён: роутеров ${hops.where((h) => h.status == HopStatus.ok || h.status == HopStatus.edge).length}, '
-          'хопов ${hops.length}. Карта построена.');
+      final done = hops.where((h) => h.status == HopStatus.ok || h.status == HopStatus.edge).length;
+      _log('Обход завершён: пройдено роутеров $done, всего хопов ${hops.length}. Карта построена.');
       await app.saveState();
       app.analyzeLocal();
     } catch (e, st) {
@@ -110,7 +146,6 @@ class WalkController extends ChangeNotifier {
     }
     hop.note = d.effectiveVendor.label;
 
-    // недостижим?
     if (d.ports.isEmpty && !d.icmp) {
       hop.status = HopStatus.unreachable;
       _log('$ip (${d.title}) не отвечает отсюда.');
@@ -131,11 +166,7 @@ class WalkController extends ChangeNotifier {
       hop.status = HopStatus.needPassword;
       _log('$ip (${d.effectiveVendor.label}) — нужен логин и пароль.');
       final act = await _ask(hop, HopStatus.needPassword);
-      if (act.skip) {
-        hop.status = HopStatus.skipped;
-        return act.nextHop;
-      }
-      if (app.vault.get(ip) == null) {
+      if (act.skip || app.vault.get(ip) == null) {
         hop.status = HopStatus.skipped;
         return act.nextHop;
       }
@@ -156,27 +187,32 @@ class WalkController extends ChangeNotifier {
     final info = d.info!;
     hop.clients = info.arp.length;
     hop.upstream = info.gateway;
-    _log('$ip (${d.title}) — ок. Клиентов: ${hop.clients}. Вверх ведёт: ${info.gateway ?? 'нет (край сети)'}');
+    _log('$ip (${d.title}) — ок. Клиентов: ${hop.clients}. Вверх: ${info.gateway ?? 'не виден'}');
 
     final up = info.gateway;
     final upInt = Ip.parse(up ?? '');
-    if (up == null || upInt == null) {
-      hop.status = HopStatus.edge;
-      hop.note = 'нет шлюза вверх';
-      return null;
-    }
-    if (!Ip.isPrivate(upInt)) {
-      hop.status = HopStatus.edge;
-      hop.note = 'дальше интернет ($up)';
-      _log('$ip — это самый дальний роутер: за ним уже интернет ($up).');
-      return null;
-    }
-    if (_visited.contains(up)) {
+    if (up != null && upInt != null) {
+      if (!Ip.isPrivate(upInt)) {
+        hop.status = HopStatus.edge;
+        hop.note = 'дальше интернет ($up)';
+        _log('$ip — самый дальний роутер: за ним интернет ($up).');
+        return null;
+      }
+      if (_visited.contains(up)) {
+        hop.status = HopStatus.ok;
+        hop.note = 'вверх ведёт к уже пройденному $up';
+        return null;
+      }
       hop.status = HopStatus.ok;
-      return null;
+      return up;
     }
+
+    // WAN-шлюз не прочитан (точка доступа, мост или драйвер не достал) —
+    // спросим пользователя: указать следующий роутер или завершить.
     hop.status = HopStatus.ok;
-    return up;
+    hop.note = 'клиентов ${hop.clients}; шлюз вверх не виден';
+    final act = await _ask(hop, HopStatus.needNextHop);
+    return act.nextHop;
   }
 
   Future<_Act> _ask(WalkHop hop, HopStatus kind) async {

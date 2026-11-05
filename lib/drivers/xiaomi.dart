@@ -131,33 +131,54 @@ class XiaomiDriver extends RouterDriver {
       if (info.model.isEmpty) info.model = '${hw['platform'] ?? hw['version'] ?? ''}';
     }
 
-    // WAN — это путь «вверх», к интернету
+    // WAN — это путь «вверх», к интернету. На MiWiFi адрес и шлюз лежат
+    // внутри info.details (а не прямо в info).
     final wan = await _safe(() => _get('xqnetwork/wan_info'));
     if (wan is Map && wan['info'] is Map) {
       final w = wan['info'] as Map;
-      final gw = Ip.extract(asStr(w['gateway']));
+      final det = w['details'] is Map ? w['details'] as Map : const {};
+      final gw = Ip.extract(asStr(det['gateway']) ?? asStr(w['gateway']));
       if (gw != null && gw != '0.0.0.0') info.gateway = gw;
-      final ip = asStr(w['ipv4']) ?? (w['ipv4'] is List && (w['ipv4'] as List).isNotEmpty ? asStr((w['ipv4'] as List).first['ip']) : null);
-      final mask = asStr(w['mask']);
+      String? ip = asStr(det['ipaddr']) ?? asStr(w['ipaddr']);
+      String? mask = asStr(det['mask']) ?? asStr(w['mask']);
+      if (ip == null && w['ipv4'] is List && (w['ipv4'] as List).isNotEmpty) {
+        final f = (w['ipv4'] as List).first;
+        ip = asStr(f is Map ? f['ip'] : f);
+        mask = asStr(f is Map ? f['mask'] : null) ?? mask;
+      }
       if (ip != null && Ip.parse(ip) != null) {
         info.addrs.add(IfAddr('wan', ip, mask != null ? Ip.prefixFromMask(mask) : 24));
       }
-      // есть WAN-шлюз и это обычный роутер → почти всегда NAT включён
-      info.nat = gw != null && gw != '0.0.0.0';
+      final wanType = asStr(det['wanType']) ?? asStr(w['wanType']);
+      // роутер с WAN-шлюзом или типом pppoe/dhcp/static — это NAT; режим «lan»/мост — нет
+      info.nat = (gw != null && gw != '0.0.0.0') || (wanType != null && wanType != 'lan' && wanType != 'none' && wanType != '');
     }
 
-    // LAN
+    // LAN — адрес в info.ipv4[0]
     final lan = await _safe(() => _get('xqnetwork/lan_info'));
     if (lan is Map && lan['info'] is Map) {
       final l = lan['info'] as Map;
-      final ip = asStr(l['ip']) ?? host;
-      final mask = asStr(l['mask']);
+      String ip = host;
+      String? mask;
+      if (l['ipv4'] is List && (l['ipv4'] as List).isNotEmpty && (l['ipv4'] as List).first is Map) {
+        ip = asStr((l['ipv4'] as List).first['ip']) ?? host;
+        mask = asStr((l['ipv4'] as List).first['mask']);
+      } else {
+        ip = asStr(l['ip']) ?? host;
+        mask = asStr(l['mask']);
+      }
       info.addrs.add(IfAddr('lan', ip, mask != null ? Ip.prefixFromMask(mask) : 24));
-      final dhcpOn = asBool(l['dhcp_on'] ?? l['dhcpstart'] != null);
-      info.dhcp.add(DhcpServerInfo('lan', 'LAN DHCP', 'lan', dhcpOn,
-          range: l['dhcpstart'] != null ? '${l['dhcpstart']}–${l['dhcpend'] ?? ''}' : null));
     } else {
       info.addrs.add(IfAddr('lan', host, 24));
+    }
+
+    // DHCP-сервер LAN (если прошивка отдаёт)
+    final dh = await _safe(() => _get('xqnetwork/dhcp'));
+    if (dh is Map && (dh['dhcp'] is Map || dh['info'] is Map)) {
+      final d = (dh['dhcp'] ?? dh['info']) as Map;
+      final on = asBool(d['open'] ?? d['on'] ?? d['ignore'] == null);
+      info.dhcp.add(DhcpServerInfo('lan', 'LAN DHCP', 'lan', on,
+          range: d['start'] != null ? '${d['start']}–${d['end'] ?? ''}' : null));
     }
 
     // Wi-Fi
