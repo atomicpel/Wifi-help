@@ -176,6 +176,46 @@ class AppState extends ChangeNotifier {
     if (drv == null) return 'Для ${d.effectiveVendor.label} автонастройка пока не поддерживается';
     Log.i('query', 'Опрос ${d.ip} (${d.effectiveVendor.label})');
     try {
+      RouterInfo info;
+      try {
+        await drv.login();
+        info = await drv.collect();
+      } on SocketException catch (e) {
+        // сеть сменилась (VPN переподключился: tun0 → tun1) — привязываемся заново и повторяем
+        final code = e.osError?.errorCode;
+        if (code != 1 && code != 64 && code != 101 && code != 113) rethrow;
+        Log.w('query', '${d.ip}: сеть сменилась ($code), привязываюсь заново');
+        await rebindNetwork();
+        await drv.close();
+        return await _queryOnce(d, cred);
+      }
+      d.info = info;
+      d.infoAt = DateTime.now();
+      d.lastError = null;
+      d.offline = false;
+      _learnFromRouter(d, info);
+      return null;
+    } catch (e, st) {
+      d.lastError = '$e';
+      Log.e('query', '${d.ip}: опрос не удался', e, e is DriverException ? null : st);
+      return '$e';
+    } finally {
+      await drv.close();
+      notifyListeners();
+    }
+  }
+
+  Future<void> rebindNetwork() async {
+    try {
+      net = NetInfo.fromMap(await Native.networkInfo());
+    } catch (e) {
+      Log.w('net', 'Не удалось заново привязаться к сети', e);
+    }
+  }
+
+  Future<String?> _queryOnce(Device d, Credential cred) async {
+    final drv = driverFor(d, cred)!;
+    try {
       await drv.login();
       final info = await drv.collect();
       d.info = info;
@@ -190,7 +230,6 @@ class AppState extends ChangeNotifier {
       return '$e';
     } finally {
       await drv.close();
-      notifyListeners();
     }
   }
 
@@ -218,6 +257,7 @@ class AppState extends ChangeNotifier {
     if (working) return;
     working = true;
     _status('Опрашиваю роутеры…');
+    await rebindNetwork();
     try {
       final targets = devices.values.where((d) => vault.get(d.ip) != null && d.effectiveVendor.supported).toList();
       var n = 0;
